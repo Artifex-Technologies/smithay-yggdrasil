@@ -177,6 +177,11 @@ while using input handle methods that don't affect the grab.) As a result there 
   `XDG_RUNTIME_DIR`. This lets `Xwayland` find GPU drivers installed outside
   the default paths, for example through `LD_LIBRARY_PATH`.
 
+- `X11Sockets` binds an X11 display's listening sockets apart from starting `Xwayland`, and
+  `XWayland::spawn_with_sockets` starts `Xwayland` on them. A compositor can bind the display first (so `DISPLAY` is known
+  at once) and start `Xwayland` only when an X11 client first connects, as wlroots' lazy XWayland does. `XWayland::spawn`
+  and `XWayland::spawn_with_inherited_env` work as before.
+
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
 
 
