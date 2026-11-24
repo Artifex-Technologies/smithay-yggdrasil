@@ -1347,13 +1347,14 @@ impl X11Wm {
             .randr_get_output_primary(self.screen.root)?
             .reply()?
             .output;
+        // The new primary is remembered at once, so the OutputChange event this causes is not taken for a change made by
+        // someone else (see the RandrNotify handler). Its sequence number is not put on `sequences_to_ignore`: every event
+        // carries the number of the last request this connection made, so until the window manager made another request,
+        // every event (a client's MapRequest too) was dropped.
         let Some(output) = output else {
             if current_primary != x11rb::NONE {
-                let cookie = self
-                    .conn
-                    .randr_set_output_primary(self.screen.root, x11rb::NONE)?;
-                self.sequences_to_ignore
-                    .push(Reverse(cookie.sequence_number() as u16));
+                self.conn.randr_set_output_primary(self.screen.root, x11rb::NONE)?;
+                self.randr_primary = x11rb::NONE;
             }
             return Ok(());
         };
@@ -1372,9 +1373,8 @@ impl X11Wm {
             if name == output.name() {
                 // we got our output
                 if output_xid != current_primary {
-                    let cookie = self.conn.randr_set_output_primary(self.screen.root, output_xid)?;
-                    self.sequences_to_ignore
-                        .push(Reverse(cookie.sequence_number() as u16));
+                    self.conn.randr_set_output_primary(self.screen.root, output_xid)?;
+                    self.randr_primary = output_xid;
                     return Ok(());
                 }
             }
@@ -1448,11 +1448,14 @@ where
             }
 
             let geo = conn.get_geometry(n.window)?.reply()?;
+            // the client scale as it is (1.25, not 1): a window shown where it was made is drawn there
             let geometry = Rectangle::<i32, Client>::new(
                 (geo.x as i32, geo.y as i32).into(),
                 (geo.width as i32, geo.height as i32).into(),
             )
-            .to_logical(xwm.client_scale.load(Ordering::Acquire) as i32);
+            .to_f64()
+            .to_logical(xwm.client_scale.load(Ordering::Acquire))
+            .to_i32_round();
 
             let surface = X11Surface::new(
                 Some(xwm),
