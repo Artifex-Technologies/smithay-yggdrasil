@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use crate::utils::{IsAlive, Logical, Serial, Size, SERIAL_COUNTER};
 use crate::wayland::compositor;
 use _session_lock::ext_session_lock_surface_v1::{Error, ExtSessionLockSurfaceV1, Request};
+use wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
 use wayland_protocols::ext::session_lock::v1::server::{self as _session_lock, ext_session_lock_surface_v1};
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, Resource, Weak};
@@ -18,6 +19,8 @@ pub struct ExtLockSurfaceUserData {
     // `ExtSessionLockSurfaceV1`. So this reference needs to be weak to avoid a
     // cycle.
     pub(crate) surface: Weak<WlSurface>,
+    /// The lock this surface was made for: only the lock the compositor confirmed should be shown.
+    pub(crate) lock: ExtSessionLockV1,
 }
 
 impl<D> Dispatch<ExtSessionLockSurfaceV1, ExtLockSurfaceUserData, D> for SessionLockManagerState
@@ -130,6 +133,14 @@ impl PartialEq for LockSurface {
 }
 
 impl LockSurface {
+    /// The `ext_session_lock_v1` this surface was made for. Any client may make lock surfaces for a lock of its own, also one
+    /// the compositor refused (it sent `finished`): a compositor shows and focuses only the surfaces of the lock it confirmed.
+    pub fn lock(&self) -> Option<ExtSessionLockV1> {
+        self.shell_surface
+            .data::<ExtLockSurfaceUserData>()
+            .map(|d| d.lock.clone())
+    }
+
     pub(crate) fn new(surface: WlSurface, shell_surface: ExtSessionLockSurfaceV1) -> Self {
         Self {
             surface,

@@ -11,6 +11,7 @@ use crate::wayland::viewporter::{ViewportCachedState, ViewporterSurfaceState};
 use _session_lock::ext_session_lock_surface_v1::ExtSessionLockSurfaceV1;
 use _session_lock::ext_session_lock_v1::{Error, ExtSessionLockV1, Request};
 use wayland_protocols::ext::session_lock::v1::server::{self as _session_lock, ext_session_lock_surface_v1};
+use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, Resource};
 
 use crate::wayland::session_lock::surface::{ExtLockSurfaceUserData, LockSurface, LockSurfaceAttributes};
@@ -23,12 +24,16 @@ const LOCK_SURFACE_ROLE: &str = "ext_session_lock_surface_v1";
 #[derive(Debug)]
 pub struct SessionLockState {
     pub(crate) lock_status: Arc<AtomicBool>,
+    /// The outputs this lock has a lock surface on (one each). Per lock: each client's `wl_output` objects are its own, and
+    /// several locks can be alive at once.
+    pub(crate) locked_outputs: Mutex<Vec<WlOutput>>,
 }
 
 impl SessionLockState {
     pub(crate) fn new() -> Self {
         Self {
             lock_status: Arc::new(AtomicBool::new(false)),
+            locked_outputs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -57,13 +62,14 @@ where
                     return;
                 }
 
-                // Ensure output is not already locked.
-                let lock_state = state.lock_state();
-                if lock_state.locked_outputs.contains(&output) {
+                // Ensure output is not already locked by this lock.
+                let mut locked_outputs = data.locked_outputs.lock().unwrap();
+                if locked_outputs.contains(&output) {
                     lock.post_error(Error::DuplicateOutput, "Output is already locked.");
                     return;
                 }
-                lock_state.locked_outputs.push(output.clone());
+                locked_outputs.push(output.clone());
+                drop(locked_outputs);
 
                 // Ensure surface has no existing buffers attached.
                 let has_buffer = compositor::with_states(&surface, |states| {
@@ -80,6 +86,7 @@ where
 
                 let data = ExtLockSurfaceUserData {
                     surface: surface.downgrade(),
+                    lock: lock.clone(),
                 };
                 let lock_surface = data_init.init(id, data);
 
@@ -179,12 +186,14 @@ where
                 lock_surface.send_configure();
             }
             Request::UnlockAndDestroy => {
-                // Ensure session is locked.
+                // Only the lock the compositor confirmed (it was sent `locked`) may unlock the session. Any other lock, one
+                // the compositor refused (it was sent `finished`) included, is an error, and the session stays locked.
                 if !data.lock_status.load(Ordering::Relaxed) {
                     lock.post_error(Error::InvalidUnlock, "Session is not locked.");
+                    return;
                 }
 
-                state.lock_state().locked_outputs.clear();
+                data.locked_outputs.lock().unwrap().clear();
                 state.unlock();
             }
             Request::Destroy => {
