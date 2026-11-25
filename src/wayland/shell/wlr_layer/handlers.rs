@@ -186,8 +186,10 @@ where
     ) {
         match request {
             zwlr_layer_surface_v1::Request::SetSize { width, height } => {
+                // the protocol's size is unsigned; above i32::MAX `as` would make it negative
+                let clamp = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
                 let _ = with_surface_pending_state(layer_surface, |data| {
-                    data.size = (width as i32, height as i32).into();
+                    data.size = (clamp(width), clamp(height)).into();
                 });
             }
             zwlr_layer_surface_v1::Request::SetAnchor { anchor } => {
