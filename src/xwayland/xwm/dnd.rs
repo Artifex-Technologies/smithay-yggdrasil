@@ -117,23 +117,30 @@ impl XWmDnd {
                 res = true;
             }
         }
-        if let Some(offer) = self.active_offer.as_ref() {
-            let mut state = offer.state.lock().unwrap();
-            if state.target == *window || state.proxy == Some(*window) {
-                // The target went away (its client crashed or was killed) and will never send XdndFinished.
-                // Left as it is, the offer would stay active for good: every new X11 drag would lose
-                // XdndSelection to us (see `xfixes_selection_notify`), and the source would never hear back.
-                let dropped = state.dropped;
-                // a grab still over the window can no longer drop on it
-                state.active = false;
-                std::mem::drop(state);
-                let offer = self.active_offer.take().unwrap();
-                if dropped {
-                    offer.source.cancel();
-                }
-            }
+        if self.active_offer.as_ref().is_some_and(|offer| {
+            let state = offer.state.lock().unwrap();
+            state.target == *window || state.proxy == Some(*window)
+        }) {
+            // The target went away (its client crashed or was killed) and will never send XdndFinished.
+            // Left as it is, the offer would stay active for good: every new X11 drag would lose
+            // XdndSelection to us (see `xfixes_selection_notify`), and the source would never hear back.
+            self.end_offer();
         }
         res
+    }
+
+    /// Ends the active offer, whose target will never send XdndFinished: a grab still over the target
+    /// can no longer drop on it, and the source of a drop already made is cancelled.
+    pub fn end_offer(&mut self) {
+        if let Some(offer) = self.active_offer.take() {
+            let mut state = offer.state.lock().unwrap();
+            state.active = false;
+            let dropped = state.dropped;
+            std::mem::drop(state);
+            if dropped {
+                offer.source.cancel();
+            }
+        }
     }
 
     pub fn has_window(&self, window: &X11Window) -> bool {

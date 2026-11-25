@@ -1059,6 +1059,16 @@ impl X11Wm {
                 }
             }
             calloop::channel::Event::Closed => {
+                // The compositor may drop the X11Wm in `disconnected`. End first what still waits on
+                // Xwayland: each transfer's event source looks the X11Wm up through `xwm_state`, and a
+                // drop on an X11 window will never be finished.
+                let xwm = data.xwm_state(id);
+                if let Some(event_handle) = event_handle.upgrade() {
+                    for selection in [&mut xwm.clipboard, &mut xwm.primary, &mut xwm.dnd.selection] {
+                        selection.end_transfers(&event_handle);
+                    }
+                }
+                xwm.dnd.end_offer();
                 data.disconnected(id);
             }
         })?;
@@ -2077,7 +2087,6 @@ where
                                 },
                             )
                             .map_err(|err| err.error)?;
-                        loop_handle.disable(&token)?;
 
                         let transfer = IncomingTransfer {
                             token: Some(token),
@@ -2087,6 +2096,8 @@ where
                             incr_done: false,
                         };
                         selection.incoming.insert(incoming_window, transfer);
+                        // after the insert: should this fail, the transfer still ends with its selection
+                        loop_handle.disable(&token)?;
                         selection.incoming.get_mut(&incoming_window).unwrap()
                     };
 
@@ -2240,8 +2251,11 @@ where
                                 "Destroying stale transfer",
                             );
                             if transfer.token.is_some() {
-                                send_selection_notify_resp(&transfer.conn, &transfer.request, false)?;
+                                // Destroyed before the answer, which fails once Xwayland is gone: its event
+                                // source must not outlive it.
+                                let request = transfer.request;
                                 transfer.destroy(loop_handle);
+                                send_selection_notify_resp(&conn, &request, false)?;
                             }
                         }
 

@@ -242,6 +242,18 @@ impl XWmSelection {
         }) || self.pending_transfers.lock().unwrap().remove(window).is_some()
     }
 
+    /// Ends every transfer of this selection: their event sources are removed and their pipes
+    /// closed, so the Wayland clients at the other ends see them end.
+    pub fn end_transfers<D>(&mut self, loop_handle: &LoopHandle<'_, D>) {
+        for (_, transfer) in self.incoming.drain() {
+            transfer.destroy(loop_handle);
+        }
+        for (_, transfer) in self.outgoing.drain() {
+            transfer.destroy(loop_handle);
+        }
+        self.pending_transfers.lock().unwrap().clear();
+    }
+
     pub fn has_window(&self, window: &X11Window) -> bool {
         self.window == *window
             || self.incoming.contains_key(window)
