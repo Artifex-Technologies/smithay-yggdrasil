@@ -16,7 +16,7 @@ use rustix::fs::OFlags;
 use smallvec::SmallVec;
 use tracing::{debug, trace, warn};
 #[cfg(feature = "wayland_frontend")]
-use wayland_server::DisplayHandle;
+use wayland_server::{DisplayHandle, Resource};
 use x11rb::{
     CURRENT_TIME,
     connection::Connection as _,
@@ -40,8 +40,9 @@ use crate::{
         pointer::Focus,
     },
     utils::{IsAlive, Logical, Point, Serial},
+    wayland::seat::WaylandFocus,
     xwayland::{
-        X11Surface, XwmHandler,
+        X11Surface, XWaylandClientData, XwmHandler,
         xwm::{Atoms, OwnedX11Window, XwmId, atom_from_mime, mime_from_atom, selection::XWmSelection},
     },
 };
@@ -116,6 +117,22 @@ impl XWmDnd {
                 res = true;
             }
         }
+        if let Some(offer) = self.active_offer.as_ref() {
+            let mut state = offer.state.lock().unwrap();
+            if state.target == *window || state.proxy == Some(*window) {
+                // The target went away (its client crashed or was killed) and will never send XdndFinished.
+                // Left as it is, the offer would stay active for good: every new X11 drag would lose
+                // XdndSelection to us (see `xfixes_selection_notify`), and the source would never hear back.
+                let dropped = state.dropped;
+                // a grab still over the window can no longer drop on it
+                state.active = false;
+                std::mem::drop(state);
+                let offer = self.active_offer.take().unwrap();
+                if dropped {
+                    offer.source.cancel();
+                }
+            }
+        }
         res
     }
 
@@ -180,6 +197,10 @@ impl XWmDnd {
 
         trace!("New XDND selection from {}", event.owner);
         // figure out, if we have a grab
+        //
+        // Only a grab that started on a surface of this XWayland can become an X11 drag. Any X11 client may
+        // take XdndSelection at any time; otherwise it would replace whatever grab holds the left button
+        // (a Wayland client's drag, a compositor's move) and offer its own data to the surface under the pointer.
         let ptr_grab = data
             .seat_state()
             .seats
@@ -187,7 +208,10 @@ impl XWmDnd {
             .flat_map(|seat| {
                 seat.get_pointer().and_then(|ptr| {
                     ptr.with_grab(|serial, grab| (seat.clone(), serial, grab.start_data().clone()))
-                        .filter(|(_, _, start_data)| start_data.button == BTN_LEFT)
+                        .filter(|(_, _, start_data)| {
+                            start_data.button == BTN_LEFT
+                                && started_on_xwayland(start_data.focus.as_ref(), id)
+                        })
                 })
             })
             .max_by(|(_, s1, _), (_, s2, _)| s1.partial_cmp(s2).unwrap_or(cmp::Ordering::Equal));
@@ -198,7 +222,9 @@ impl XWmDnd {
             .iter()
             .flat_map(|seat| {
                 seat.get_touch().and_then(|touch| {
-                    touch.with_grab(|serial, grab| (seat.clone(), serial, grab.start_data().clone()))
+                    touch
+                        .with_grab(|serial, grab| (seat.clone(), serial, grab.start_data().clone()))
+                        .filter(|(_, _, start_data)| started_on_xwayland(start_data.focus.as_ref(), id))
                 })
             })
             .max_by(|(_, s1, _), (_, s2, _)| s1.partial_cmp(s2).unwrap_or(cmp::Ordering::Equal));
@@ -266,6 +292,7 @@ impl XWmDnd {
             target: window.clone(),
             state: state.clone(),
             pending_transfers: xwm.dnd.selection.pending_transfers.clone(),
+            xdnd_active: xwm.dnd.xdnd_active.clone(),
         };
         xwm.dnd.active_drag = Some(XwmActiveDrag {
             target: window,
@@ -730,6 +757,22 @@ pub struct XwmDndSource {
 
     state: Arc<Mutex<XwmSourceState>>,
     pending_transfers: Arc<Mutex<HashMap<X11Window, (OwnedX11Window, OwnedFd)>>>,
+    xdnd_active: Arc<AtomicBool>,
+}
+
+impl XwmDndSource {
+    /// The grab ended while the X11 client had left the proxy (it sent XdndLeave, e.g. because the drag was cancelled
+    /// with Escape): no XdndDrop will come for this drag any more, so it is over on the X11 side.
+    ///
+    /// Without this the drag stays active until the next XdndSelection change: override-redirect windows are skipped by
+    /// `X11Surface::surface_under` (menus let the pointer through), and the same client taking XdndSelection again for its
+    /// next drag is ignored.
+    fn grab_ended(&self, state: &mut XwmSourceState) {
+        if state.x11 == X11State::Left {
+            state.x11 = X11State::Finished;
+            self.xdnd_active.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for XwmDndSource {
@@ -806,12 +849,15 @@ impl Source for XwmDndSource {
     }
 
     fn drop_performed(&self) {
-        self.state.lock().unwrap().wayland = WlState::Dropped;
+        let mut state = self.state.lock().unwrap();
+        state.wayland = WlState::Dropped;
+        self.grab_ended(&mut state);
     }
 
     fn cancel(&self) {
         let mut state = self.state.lock().unwrap();
         state.wayland = WlState::Cancelled;
+        self.grab_ended(&mut state);
 
         if state.x11 == X11State::Dropped {
             if let (Some(conn), Some(source)) = (self.conn.upgrade(), state.source) {
@@ -902,6 +948,19 @@ impl fmt::Debug for XwmActiveOffer {
 pub struct XwmOfferData<S: Source> {
     state: Arc<Mutex<XwmOfferState>>,
     source: Arc<S>,
+}
+
+/// Whether a grab's focus is a surface of the XWayland instance `id`.
+fn started_on_xwayland<F: WaylandFocus>(focus: Option<&(F, Point<f64, Logical>)>, id: XwmId) -> bool {
+    focus
+        .and_then(|(focus, _)| focus.wl_surface())
+        .and_then(|surface| surface.client())
+        .is_some_and(|client| {
+            client
+                .get_data::<XWaylandClientData>()
+                .and_then(|data| data.user_data().get::<XwmId>())
+                == Some(&id)
+        })
 }
 
 fn get_proxy_window(
