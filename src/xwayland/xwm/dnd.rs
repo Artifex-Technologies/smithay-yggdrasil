@@ -538,7 +538,13 @@ impl XWmDnd {
                 return;
             }
 
-            offer.source.finished();
+            // From XDND 5 on, the target says whether it took the drop (data.l[1] bit 0). One that did not (it failed to
+            // use what it read) has the drop cancelled: told finished, a source moving its data would delete it.
+            if offer_state.version >= 5 && data[1] & 1 == 0 {
+                offer.source.cancel();
+            } else {
+                offer.source.finished();
+            }
             std::mem::drop(offer_state);
             self.active_offer.take();
             self.disarm_drop_timeout();
@@ -1049,6 +1055,8 @@ impl Source for XwmDndSource {
 struct XwmOfferState {
     target: X11Window,
     proxy: Option<X11Window>,
+    /// The XDND version agreed with the target (its XdndAware, at most ours)
+    version: u32,
 
     preferred_action: DndAction,
     supported_actions: SmallVec<[DndAction; 3]>,
@@ -1249,6 +1257,7 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
                 state: Arc::new(Mutex::new(XwmOfferState {
                     target: self.window_id(),
                     proxy,
+                    version,
 
                     preferred_action: if metadata.dnd_actions.contains(&DndAction::Copy) {
                         DndAction::Copy
