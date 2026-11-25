@@ -879,7 +879,7 @@ impl X11Wm {
             conn.randr_select_input(screen.root, NotifyMask::OUTPUT_CHANGE | NotifyMask::SCREEN_CHANGE)?;
         }
 
-        // Tell XWayland that we are the WM by acquiring the WM_S0 selection. No X11 clients are accepted before this.
+        // The window manager's own window: it will own WM_S0 (below).
         let win = conn.generate_id()?;
         conn.create_window(
             screen.root_depth,
@@ -895,8 +895,6 @@ impl X11Wm {
             x11rb::COPY_FROM_PARENT,
             &Default::default(),
         )?;
-        conn.set_selection_owner(win, atoms.WM_S0, x11rb::CURRENT_TIME)?;
-        conn.set_selection_owner(win, atoms._NET_WM_CM_S0, x11rb::CURRENT_TIME)?;
         conn.composite_redirect_subwindows(screen.root, Redirect::MANUAL)?;
 
         // Set some EWMH properties
@@ -992,6 +990,13 @@ impl X11Wm {
 
         let conn = Arc::new(conn);
         let xsettings = XSettings::new(&conn, screen.root_depth, screen.root, &atoms)?;
+
+        // Tell XWayland that we are the WM by acquiring the WM_S0 selection. No X11 clients are accepted before this,
+        // so it comes last: XWayland serves clients in turns, and one already waiting on its socket could otherwise be
+        // served before the rest of this setup. A window it mapped before the root's subwindows are redirected gets no
+        // damage tracking when the redirect comes, and its surface is never given a buffer.
+        conn.set_selection_owner(win, atoms.WM_S0, x11rb::CURRENT_TIME)?;
+        conn.set_selection_owner(win, atoms._NET_WM_CM_S0, x11rb::CURRENT_TIME)?;
         conn.flush()?;
 
         let source = X11Source::new(Arc::clone(&conn), win, atoms._SMITHAY_CLOSE_CONNECTION);
