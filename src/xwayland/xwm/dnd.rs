@@ -545,6 +545,21 @@ impl XWmDnd {
         }
     }
 
+    /// Whether a drop on the X11 window the drag is offered to is in progress: that window was sent XdndDrop for a
+    /// drop the grab took, accepted the drag in its last answer (XdndStatus), and asks for the drag's data until it
+    /// finishes (`handle_finished`) or the drop ends without that (`end_offer`: the window went away, `DROP_TIMEOUT`
+    /// is up, the next drag came over an X11 window, or the X connection closed). Each of these takes the active offer.
+    pub fn drop_in_progress(&self) -> bool {
+        self.active_offer.as_ref().is_some_and(|offer| {
+            let state = offer.state.lock().unwrap();
+            // XdndDrop also goes to a window that refused the drag; the grab then disables the offer and cancels the
+            // source. A drop waits for the answer to a pending XdndPosition, and `handle_status` sends XdndDrop then
+            // whatever that answer says: the grab took the drop on the answer before it, so the offer stays active
+            // when this one refuses, and only `client_accepts` tells.
+            state.active && state.dropped && !state.pos_pending && state.client_accepts
+        })
+    }
+
     pub fn transfer(&mut self, mime_type: impl AsRef<str>, send_fd: OwnedFd) {
         if let Some(offer) = self.active_offer.as_ref() {
             offer.source.send(mime_type.as_ref(), send_fd);

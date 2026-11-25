@@ -2149,6 +2149,12 @@ where
                 .unwrap_or(true);
 
             let xwm = state.xwm_state(xwm_id);
+            // A drag's data is for the X11 window that took its drop, which asks for it once told of the drop and
+            // until the drop ends. X11 cannot tell which client sent a request (a requestor may name another
+            // client's window), so answering earlier would let any X11 client read a Wayland client's drag while
+            // it is over any XdndAware window. Its types (TARGETS) stay readable: XdndEnter carries them anyway,
+            // and a target may decide from them.
+            let data_allowed = n.selection != xwm.atoms.XdndSelection || xwm.dnd.drop_in_progress();
             let selection = match n.selection {
                 x if x == xwm.atoms.CLIPBOARD => &mut xwm.clipboard,
                 x if x == xwm.atoms.PRIMARY => &mut xwm.primary,
@@ -2224,6 +2230,15 @@ where
                         send_selection_notify_resp(&conn, &n, true)?;
                     }
                     target => {
+                        if !data_allowed {
+                            debug!(
+                                requestor = n.requestor,
+                                "XdndSelection data requested with no drop in progress, refused"
+                            );
+                            send_selection_notify_resp(&conn, &n, false)?;
+                            return Ok(());
+                        }
+
                         let Some(mime_type) = mime_from_atom(target, &conn, &xwm.atoms)? else {
                             debug!("Unable to determine mime type from atom: {}", target);
                             send_selection_notify_resp(&conn, &n, false)?;
