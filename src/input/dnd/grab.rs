@@ -493,6 +493,13 @@ where
             return;
         }
 
+        // An X11 client's drag (see `touch_focus`) ends with the lift reaching Xwayland, as a pointer
+        // drag's button release does (see `PointerGrab::button`): the client drops only once Xwayland
+        // ends its touch, which stays down otherwise.
+        if self.touch_focus().is_some() {
+            handle.up(data, event);
+        }
+
         // the user dropped, proceed to the drop
         self.should_drop = true;
         handle.unset_grab(self, data);
