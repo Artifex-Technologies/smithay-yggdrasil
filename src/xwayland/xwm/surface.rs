@@ -1724,11 +1724,14 @@ impl X11Surface {
         .map(|reply| {
             reply.and_then(|reply| {
                 reply.value32().and_then(|mut values| {
+                    // The frame lies inside the window, and an X window is at most u16::MAX pixels
+                    // wide or high. Larger values are clamped, so that geometry() and the arithmetic
+                    // compositors do with the extents cannot overflow.
                     Some(FrameExtents::new(
-                        (values.next()? as i32).max(0),
-                        (values.next()? as i32).max(0),
-                        (values.next()? as i32).max(0),
-                        (values.next()? as i32).max(0),
+                        (values.next()? as i32).clamp(0, u16::MAX.into()),
+                        (values.next()? as i32).clamp(0, u16::MAX.into()),
+                        (values.next()? as i32).clamp(0, u16::MAX.into()),
+                        (values.next()? as i32).clamp(0, u16::MAX.into()),
                     ))
                 })
             })
