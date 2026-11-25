@@ -1452,7 +1452,8 @@ impl X11Wm {
         // every event (a client's MapRequest too) was dropped.
         let Some(output) = output else {
             if current_primary != x11rb::NONE {
-                self.conn.randr_set_output_primary(self.screen.root, x11rb::NONE)?;
+                self.conn
+                    .randr_set_output_primary(self.screen.root, x11rb::NONE)?;
                 self.randr_primary = x11rb::NONE;
             }
             return Ok(());
