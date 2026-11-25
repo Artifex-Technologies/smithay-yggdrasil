@@ -234,9 +234,9 @@ impl XWmDnd {
             return;
         }
         // Only the drop of the active offer arms the alarm (`DndFocus::drop`), each one anew, so an active
-        // offer that was dropped is the alarm's own. Any other is a second drag's, at the same time: the
-        // alarm's drop lost the offer to it (that drag's `DndFocus::leave` clears the active offer,
-        // whichever drag it is), and the alarm ends nothing.
+        // offer that was dropped is the alarm's own. Any other is a second drag's, at the same time, which
+        // came over an X11 window after the drop and ended it then (`end_waiting_drop`); a drag leaving an
+        // X11 window clears only its own offer (`DndFocus::leave`). The alarm then ends nothing.
         if self
             .active_offer
             .as_ref()
@@ -1379,7 +1379,16 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
             }
             let _ = xwm.conn.flush();
 
-            xwm.dnd.active_offer = None;
+            // Only this drag's own offer: with two drags at once (a pointer's and a finger's), the active one may be the
+            // other drag's, a drop still waiting for its target, which only its own end may clear.
+            if xwm
+                .dnd
+                .active_offer
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.state, &offer.state))
+            {
+                xwm.dnd.active_offer = None;
+            }
         }
     }
 
