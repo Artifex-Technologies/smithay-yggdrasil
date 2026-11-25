@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use calloop::LoopHandle;
@@ -22,6 +23,7 @@ use x11rb::{
     connection::Connection as _,
     errors::{ConnectionError, ReplyOrIdError},
     protocol::{
+        sync::{Alarm, ConnectionExt as _, Counter, CreateAlarmAux, Int64, TESTTYPE, VALUETYPE},
         xfixes::SelectionNotifyEvent,
         xproto::{
             Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConfigureWindowAux, ConnectionExt,
@@ -51,6 +53,15 @@ use crate::{
 const BTN_LEFT: u32 = 0x110;
 const DND_VERSION: u32 = 5;
 const MIN_DND_VERSION: u32 = 2;
+/// How long a drop on an X11 window waits for the target's XdndFinished (and first, when a position is
+/// still unanswered, for its XdndStatus). A target that has not finished by then is taken for hung: the
+/// offer ends and its source is cancelled.
+///
+/// The XDND spec gives no figure, only that a source "must be prepared to time out in case the target
+/// malfunctions". Targets finish within milliseconds of reading the data; this leaves room for a large
+/// transfer or a target that asks the user first, while an offer left active keeps every new X11 drag
+/// from taking XdndSelection (see `xfixes_selection_notify`).
+const DROP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct XWmDnd {
@@ -58,6 +69,9 @@ pub struct XWmDnd {
     pub active_offer: Option<XwmActiveOffer>,
     pub active_drag: Option<XwmActiveDrag>,
     pub xdnd_active: Arc<AtomicBool>,
+    /// The alarm, on the X server's SERVERTIME counter, that ends the active offer `DROP_TIMEOUT` after
+    /// its drop
+    drop_alarm: Option<Alarm>,
 }
 
 impl XWmDnd {
@@ -78,6 +92,7 @@ impl XWmDnd {
             active_offer: None,
             active_drag: None,
             xdnd_active: Arc::new(AtomicBool::new(false)),
+            drop_alarm: None,
         })
     }
 
@@ -129,17 +144,111 @@ impl XWmDnd {
         res
     }
 
-    /// Ends the active offer, whose target will never send XdndFinished: a grab still over the target
+    /// Ends the active offer, whose target will not send XdndFinished: a grab still over the target
     /// can no longer drop on it, and the source of a drop already made is cancelled.
     pub fn end_offer(&mut self) {
+        self.disarm_drop_timeout();
         if let Some(offer) = self.active_offer.take() {
             let mut state = offer.state.lock().unwrap();
+            // A drop the target took was performed, as far as its source knows, which now waits for the
+            // end. One it did not take was cancelled by the grab already (its offer was disabled).
+            let performed = state.dropped && state.active;
             state.active = false;
-            let dropped = state.dropped;
             std::mem::drop(state);
-            if dropped {
+            if performed {
                 offer.source.cancel();
             }
+        }
+    }
+
+    /// Ends the active offer, a drop still waiting for its target, which is still there (`end_offer`). A
+    /// target that was never sent the drop, as it had not answered the last position, is told the drag
+    /// left (XdndLeave), so that it does not keep a drag it believes is still over it. One that was sent
+    /// the drop is told nothing more: after XdndDrop, only the target speaks (XdndFinished).
+    fn end_waiting_drop(&mut self) {
+        if let Some(offer) = self.active_offer.as_ref() {
+            let state = offer.state.lock().unwrap();
+            if state.pos_pending {
+                let data = [*self.selection.window, 0, 0, 0, 0];
+                trace!("Sending XdndLeave: {:?}", data);
+                if let Err(err) = self.selection.conn.send_event(
+                    false,
+                    state.proxy.unwrap_or(state.target),
+                    EventMask::NO_EVENT,
+                    ClientMessageEvent::new(32, state.target, self.selection.atoms.XdndLeave, data),
+                ) {
+                    warn!("Failed to send DND_LEAVE event: {:?}", err);
+                }
+                let _ = self.selection.conn.flush();
+            }
+        }
+        self.end_offer();
+    }
+
+    /// Arms the timeout of the active offer's drop (`DROP_TIMEOUT`): an alarm on the X server's SERVERTIME
+    /// counter, relative to its value now (the server reads a system counter when it sets an alarm on
+    /// it), which goes off once and is reported as an AlarmNotify (`handle_alarm`). Without the SYNC
+    /// extension (`servertime` is `None`), a drop has no timeout.
+    fn arm_drop_timeout(&mut self, servertime: Option<Counter>) {
+        self.disarm_drop_timeout();
+        let Some(servertime) = servertime else {
+            return;
+        };
+        let conn = &self.selection.conn;
+        let alarm = match conn.generate_id() {
+            Ok(alarm) => alarm,
+            Err(err) => {
+                warn!(?err, "Failed to arm the timeout of an XDND drop");
+                return;
+            }
+        };
+        let aux = CreateAlarmAux::new()
+            .counter(servertime)
+            .value_type(VALUETYPE::RELATIVE)
+            .value(Int64 {
+                hi: 0,
+                lo: DROP_TIMEOUT.as_millis() as u32,
+            })
+            .test_type(TESTTYPE::POSITIVE_COMPARISON)
+            .delta(Int64 { hi: 0, lo: 0 })
+            .events(1);
+        if let Err(err) = conn.sync_create_alarm(alarm, &aux).and_then(|_| conn.flush()) {
+            warn!(?err, "Failed to arm the timeout of an XDND drop");
+            return;
+        }
+        self.drop_alarm = Some(alarm);
+    }
+
+    fn disarm_drop_timeout(&mut self) {
+        if let Some(alarm) = self.drop_alarm.take() {
+            // fails only when the X connection is gone, and the alarm with it
+            let _ = self.selection.conn.sync_destroy_alarm(alarm);
+            let _ = self.selection.conn.flush();
+        }
+    }
+
+    /// The alarm `alarm` went off: when it is the timeout of the active offer's drop, the target did not
+    /// finish the drop in time, and the drop ends.
+    pub fn handle_alarm(&mut self, alarm: Alarm) {
+        if self.drop_alarm != Some(alarm) {
+            return;
+        }
+        // Only the drop of the active offer arms the alarm (`DndFocus::drop`), each one anew, so an active
+        // offer that was dropped is the alarm's own. Any other is a second drag's, at the same time: the
+        // alarm's drop lost the offer to it (that drag's `DndFocus::leave` clears the active offer,
+        // whichever drag it is), and the alarm ends nothing.
+        if self
+            .active_offer
+            .as_ref()
+            .is_some_and(|offer| offer.state.lock().unwrap().dropped)
+        {
+            warn!(
+                "XDND drop target did not finish the drop within {:?}, cancelling it",
+                DROP_TIMEOUT
+            );
+            self.end_waiting_drop();
+        } else {
+            self.disarm_drop_timeout();
         }
     }
 
@@ -432,6 +541,7 @@ impl XWmDnd {
             offer.source.finished();
             std::mem::drop(offer_state);
             self.active_offer.take();
+            self.disarm_drop_timeout();
         }
     }
 
@@ -1066,6 +1176,18 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
                 .inspect_err(|err| warn!("Failed to convert mime types: {:?}", err))
                 .ok()?;
 
+            // A drop still waiting for its target's XdndFinished is over: XdndSelection serves this offer
+            // from here on, so that target could no longer get its own data. It ends before this offer's
+            // XdndEnter, which may go to the same window.
+            if xwm
+                .dnd
+                .active_offer
+                .as_ref()
+                .is_some_and(|active| active.state.lock().unwrap().dropped)
+            {
+                xwm.dnd.end_waiting_drop();
+            }
+
             let mut enter_data = [
                 *xwm.dnd.selection.window,
                 version << 24,
@@ -1252,6 +1374,17 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
 
         let mut state = offer.state.lock().unwrap();
         state.dropped = true;
+        // The target has `DROP_TIMEOUT` to finish the drop, and first to answer a pending position. Only
+        // the active offer's drop is waited for (`handle_finished`): an offer no longer active (its target
+        // went away, or a second drag's offer took its place) has nothing to time out.
+        if xwm
+            .dnd
+            .active_offer
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.state, &offer.state))
+        {
+            xwm.dnd.arm_drop_timeout(xwm.servertime_counter);
+        }
         if state.pos_pending {
             return;
         }

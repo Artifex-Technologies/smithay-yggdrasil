@@ -2842,6 +2842,7 @@ where
             xwm.dnd.update_screen(&xwm.screen)?;
         }
         Event::SyncAlarmNotify(n) => {
+            xwm.dnd.handle_alarm(n.alarm);
             if let Some(surface) = xwm
                 .windows
                 .iter()
