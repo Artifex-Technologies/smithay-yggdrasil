@@ -1703,6 +1703,7 @@ where
                     // Read initial _NET_WM_STATE set by the client before mapping.
                     // Per EWMH spec, clients may set _NET_WM_STATE prior to mapping
                     // and the window manager must respect it.
+                    let mut hidden_in_property = false;
                     if let Ok(reply) = conn
                         .get_property(false, win, xwm.atoms._NET_WM_STATE, AtomEnum::ATOM, 0, 1024)?
                         .reply()
@@ -1710,6 +1711,7 @@ where
                         if let Some(states) = reply.value32() {
                             let mut state_lock = surface.state.lock().unwrap();
                             for atom in states {
+                                hidden_in_property |= atom == xwm.atoms._NET_WM_STATE_HIDDEN;
                                 state_lock.net_state.insert(atom);
                             }
                         }
@@ -1721,6 +1723,19 @@ where
                             state.net_state.insert(xwm.atoms._NET_WM_STATE_HIDDEN);
                         } else {
                             state.net_state.remove(&xwm.atoms._NET_WM_STATE_HIDDEN);
+                        }
+                        // The window's _NET_WM_STATE says what this copy says: a window that starts
+                        // Iconic is told it is hidden, and a later set_hidden(true), which changes
+                        // nothing in this copy, would not write it.
+                        if state.net_state.contains(&xwm.atoms._NET_WM_STATE_HIDDEN) != hidden_in_property {
+                            let new_props = Vec::from_iter(state.net_state.iter().copied());
+                            conn.change_property32(
+                                PropMode::REPLACE,
+                                win,
+                                xwm.atoms._NET_WM_STATE,
+                                AtomEnum::ATOM,
+                                &new_props,
+                            )?;
                         }
                     }
 
