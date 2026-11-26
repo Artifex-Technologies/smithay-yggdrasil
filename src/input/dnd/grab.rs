@@ -534,6 +534,9 @@ where
     }
 
     fn cancel(&mut self, data: &mut D, handle: &mut TouchInnerHandle<'_, D>) {
+        // the touch points are cancelled for the clients that have them, the dragging one too: an X11 client's drag
+        // (see `touch_focus`) otherwise keeps its touch down in Xwayland, as it would without the lift in `up`
+        handle.cancel(data);
         handle.unset_grab(self, data);
     }
 

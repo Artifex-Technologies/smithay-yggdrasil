@@ -692,17 +692,24 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
     }
 
     fn cancel(&mut self, data: &mut D, seat: &Seat<D>) {
-        let Some(marker) = self.pending_frame.take() else {
-            tracing::warn!("cancel called without prior events");
-            return;
-        };
+        // A cancel usually comes in a frame of its own (libinput sends LIBINPUT_EVENT_TOUCH_CANCEL alone, and a
+        // compositor that decides a touch stream is a gesture cancels between frames): it then gets a marker of its own.
+        // It ends every touch point, also those with no event since the last frame, so no point is skipped as framed
+        // already; each client still hears it once (`last_frame`).
+        let marker = self
+            .pending_frame
+            .take()
+            .unwrap_or_else(|| FrameMarker(frame_marker::next()));
 
         for state in self.focus.values_mut() {
-            if state.current.map(|c| c == state.pending).unwrap_or(false) {
-                continue;
-            }
-
             state.current = Some(marker);
+
+            // a point lifted in this frame (its frame not sent yet): its client hears the cancel instead
+            if let Some(focus) = state.frame_pending.take() {
+                if focus.last_frame(seat, data) != Some(marker) {
+                    focus.cancel(seat, data, marker);
+                }
+            }
 
             if let Some((focus, _)) = state.focus.take() {
                 if focus.last_frame(seat, data) != Some(marker) {
