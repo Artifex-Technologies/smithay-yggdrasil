@@ -225,8 +225,13 @@ impl EventSource for LibSeatSessionNotifier {
                     }
                     SeatEvent::Disable => {
                         internal.active.store(false, Ordering::SeqCst);
-                        internal.seat.borrow_mut().disable().unwrap();
+                        // The handler runs before the seat is disabled, as wlroots does: until then the
+                        // devices are still ours (with seatd the DRM device still has master, so the
+                        // handler can reset what it set on it, such as a gamma ramp), and closing a
+                        // device still succeeds. Once disabled, every request on the seat fails until
+                        // it is enabled again.
                         callback(SessionEvent::PauseSession, &mut ());
+                        internal.seat.borrow_mut().disable().unwrap();
                     }
                 },
                 channel::Event::Closed => {
