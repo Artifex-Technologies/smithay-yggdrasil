@@ -942,8 +942,12 @@ impl Drop for XwmDndSource {
 impl IsAlive for XwmDndSource {
     fn alive(&self) -> bool {
         let state = self.state.lock().unwrap();
-        !matches!(&state.wayland, &WlState::Cancelled)
-            || (matches!(&state.wayland, &WlState::Finished) && state.x11 != X11State::Finished)
+        // An X11 client that gave its drag up (XdndLeave, e.g. on Escape) while the button is still held
+        // sends no XdndDrop and gives no data: nothing may be dropped from it, unless it comes back
+        // (XdndEnter) before the button is let go.
+        state.x11 != X11State::Left
+            && (!matches!(&state.wayland, &WlState::Cancelled)
+                || (matches!(&state.wayland, &WlState::Finished) && state.x11 != X11State::Finished))
     }
 }
 

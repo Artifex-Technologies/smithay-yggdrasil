@@ -407,6 +407,10 @@ impl<S: Source> OfferData for WlOfferData<S> {
     }
 
     fn validated(&self) -> bool {
+        // a source that is gone, or an X11 drag its client gave up, has nothing left to drop
+        if !self.source.alive() {
+            return false;
+        }
         let data = self.state.lock().unwrap();
         let requires_action = self
             .wl_offers
@@ -552,6 +556,11 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
             .get::<RefCell<SeatData<D::SelectionUserData>>>()
             .unwrap()
             .borrow();
+        // the target is told the drag left, never that it was dropped, when its source has nothing
+        // left to drop (see `validated`): the grab then cancels the source and disables the offer
+        if offer.as_ref().is_some_and(|offer| !offer.source.alive()) {
+            return;
+        }
         for device in seat_data.known_data_devices() {
             if let Some(ref offer) = offer {
                 if device.version() >= wl_data_offer::REQ_SET_ACTIONS_SINCE
