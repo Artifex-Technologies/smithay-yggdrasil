@@ -899,16 +899,29 @@ pub struct XwmDndSource {
 }
 
 impl XwmDndSource {
-    /// The grab ended while the X11 client had left the proxy (it sent XdndLeave, e.g. because the drag was cancelled
-    /// with Escape): no XdndDrop will come for this drag any more, so it is over on the X11 side.
+    /// The grab ended (a drop or a cancel).
     ///
-    /// Without this the drag stays active until the next XdndSelection change: override-redirect windows are skipped by
-    /// `X11Surface::surface_under` (menus let the pointer through), and the same client taking XdndSelection again for its
-    /// next drag is ignored.
+    /// If the X11 client had left the proxy (it sent XdndLeave, e.g. because the drag was cancelled with Escape), no
+    /// XdndDrop will come for this drag any more, so it is over on the X11 side. Without this the drag stays active until
+    /// the next XdndSelection change: override-redirect windows are skipped by `X11Surface::surface_under` (menus let the
+    /// pointer through), and the same client taking XdndSelection again for its next drag is ignored.
+    ///
+    /// The proxy is unmapped here too: it covers the whole screen above every X11 window and is only needed while the
+    /// drag goes on. Left mapped until this source is dropped (when the Wayland target destroys its offer, which may be
+    /// much later or never), it took the X11 pointer events meant for the windows under it: a press on an X11 window
+    /// reached that window only if the compositor's raise of it got to Xwayland before the press did. It stays alive
+    /// (unmapped) for the transfer and XdndFinished, which name it.
     fn grab_ended(&self, state: &mut XwmSourceState) {
         if state.x11 == X11State::Left {
             state.x11 = X11State::Finished;
             self.xdnd_active.store(false, Ordering::Release);
+        }
+        if state.mapped {
+            if let Some(conn) = self.conn.upgrade() {
+                let _ = conn.unmap_window(*self.target);
+                let _ = conn.flush();
+            }
+            state.mapped = false;
         }
     }
 }
@@ -1342,7 +1355,8 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
             let xwm = data.xwm_state(xwm_id);
             if let Some(active_drag) = xwm.dnd.active_drag.as_mut() {
                 let mut drag_state = active_drag.state.lock().unwrap();
-                if !drag_state.mapped {
+                // not once the grab has ended (dropped or cancelled: the grab leaves its focus after telling the source)
+                if !drag_state.mapped && matches!(drag_state.wayland, WlState::Active) {
                     if let Err(err) = xwm.conn.map_window(*active_drag.target) {
                         warn!("Unable to map proxy dnd window: {}", err);
                         return;
